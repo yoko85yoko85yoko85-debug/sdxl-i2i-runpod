@@ -15,3 +15,4 @@ ENV HF_HOME=/runpod-volume/huggingface
 ENV PYTHONUNBUFFERED=1
 ENV TOKENIZERS_PARALLELISM=false
 CMD ["python", "-u", "/app/handler.py"]
+# Rebuild after GitHub connection update
