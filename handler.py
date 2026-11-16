@@ -8,15 +8,15 @@ from pathlib import PurePosixPath
 
 import runpod
 import torch
-from PIL import Image, ImageOps
-from diffusers import StableDiffusionXLImg2ImgPipeline
+from PIL import Image, ImageOps, ImageChops, ImageFilter
+from diffusers import StableDiffusionXLInpaintPipeline
 from huggingface_hub import HfApi, hf_hub_download
 from safetensors.torch import load_file
 
-MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 SIZES = {(640, 640), (768, 768), (1024, 1024), (1024, 768), (768, 1024)}
 Image.MAX_IMAGE_PIXELS = 20_000_000
-pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
     MODEL, torch_dtype=torch.float16, variant="fp16", use_safetensors=True,
 )
 pipe.enable_model_cpu_offload()
@@ -27,6 +27,11 @@ lora_failed = False
 
 
 def parse_request(p):
+    if p.get("mode") != "sdxl_inpaint":
+        raise ValueError("インペイント対応アプリから送信してください。")
+    edit_mode = p.get("edit_mode", "inpaint")
+    if edit_mode not in ("inpaint", "whole"):
+        raise ValueError("編集モードを確認してください。")
     encoded = p.get("image_base64")
     if not isinstance(encoded, str) or not 1 <= len(encoded) <= 4_000_000:
         raise ValueError("元画像が必要です。送信画像は3MB以下にしてください。")
@@ -45,10 +50,10 @@ def parse_request(p):
     if not 1 <= len(prompt) <= 3000 or len(negative) > 3000:
         raise ValueError("プロンプトは1〜3000文字で入力してください。")
     steps, seed = int(p.get("steps", 25)), int(p.get("seed", 42))
-    strength, guidance = float(p.get("strength", 0.45)), float(p.get("guidance", 6.0))
+    strength, guidance = float(p.get("strength", 0.85)), float(p.get("guidance", 6.0))
     if not 10 <= steps <= 50 or not 0 <= seed <= 2147483647:
         raise ValueError("ステップ数またはシード値を確認してください。")
-    if not math.isfinite(strength) or not 0.1 <= strength <= 0.95 or not math.isfinite(guidance) or not 1 <= guidance <= 15:
+    if not math.isfinite(strength) or not 0.1 <= strength <= 0.99 or not math.isfinite(guidance) or not 1 <= guidance <= 15:
         raise ValueError("変更の強さまたはCFGを確認してください。")
     lora = p.get("lora")
     if lora is not None:
@@ -63,8 +68,27 @@ def parse_request(p):
         if not math.isfinite(scale) or not 0 < scale <= 1.5:
             raise ValueError("LoRA強度は0より大きく1.5以下にしてください。")
         lora = {"repo": repo, "filename": filename, "scale": scale}
-    image = ImageOps.pad(image, (width, height), method=Image.Resampling.LANCZOS, color="black")
-    return image, prompt, negative, width, height, steps, seed, strength, guidance, lora
+    # Use the same integer rounding and centering as the browser mask editor.
+    scale = min(width / image.width, height / image.height)
+    fitted = (max(1, math.floor(image.width * scale + 0.5)), max(1, math.floor(image.height * scale + 0.5)))
+    resized = image.resize(fitted, Image.Resampling.LANCZOS)
+    image = Image.new("RGB", (width, height), "black")
+    image.paste(resized, ((width - fitted[0]) // 2, (height - fitted[1]) // 2))
+    if edit_mode == "whole":
+        mask = Image.new("L", (width, height), 255)
+    else:
+        encoded_mask = p.get("mask_base64")
+        if not isinstance(encoded_mask, str) or not 1 <= len(encoded_mask) <= 2_000_000:
+            raise ValueError("ブラシで変更したい範囲を塗ってください。")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(base64.b64decode(encoded_mask, validate=True))) as opened:
+                if opened.format != "PNG" or opened.size != (width, height):
+                    raise ValueError("マスクの形式・サイズが一致しません。画像を選び直して範囲を塗ってください。")
+                mask = opened.convert("L").point(lambda value: 255 if value >= 128 else 0)
+        if mask.getbbox() is None:
+            raise ValueError("変更する範囲が空です。ブラシで塗ってください。")
+    return image, prompt, negative, width, height, steps, seed, strength, guidance, lora, mask, edit_mode
 
 
 def configure_lora(lora):
@@ -108,19 +132,25 @@ def handler(job):
         values = parse_request(job.get("input", {}))
     except Exception as error:
         return {"error": str(error)}
-    image, prompt, negative, width, height, steps, seed, strength, guidance, lora = values
+    image, prompt, negative, width, height, steps, seed, strength, guidance, lora, mask, edit_mode = values
     with lock, torch.inference_mode():
         used_lora = configure_lora(lora)
         result = pipe(
-            image=image, prompt=prompt, negative_prompt=negative,
+            image=image, mask_image=mask, width=width, height=height, prompt=prompt, negative_prompt=negative,
             strength=strength, guidance_scale=guidance, num_inference_steps=steps,
             generator=torch.Generator("cpu").manual_seed(seed), num_images_per_prompt=1,
         ).images[0]
+    if result.size != image.size:
+        raise RuntimeError("生成画像のサイズが元画像と一致しません。")
+    if edit_mode == "inpaint":
+        # Feather only inside the selected region. Outside pixels remain the resized source exactly.
+        feather = ImageChops.multiply(mask, mask.filter(ImageFilter.GaussianBlur(4)))
+        result = Image.composite(result.convert("RGB"), image, feather)
     buffer = io.BytesIO()
     result.save(buffer, format="PNG")
     return {
         "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
-        "mime_type": "image/png", "mode": "sdxl_i2i", "model": MODEL,
+        "mime_type": "image/png", "mode": "sdxl_inpaint", "edit_mode": edit_mode, "outside_mask_preserved": edit_mode == "inpaint", "model": MODEL,
         "width": width, "height": height, "seed": seed, "lora": used_lora,
     }
 
